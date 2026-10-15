@@ -1,0 +1,13 @@
+{
+    "name":  "pc-usage-mkt",
+    "owner":  {
+                  "name":  "replay3657-wq"
+              },
+    "plugins":  [
+                    {
+                        "name":  "pc-usage",
+                        "source":  "./plugins/pc-usage",
+                        "description":  "PC별 Claude Code 토큰 사용량과 세션 메타데이터를 대시보드 아티팩트에 매시 기록"
+                    }
+                ]
+}
