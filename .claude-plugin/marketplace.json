@@ -7,7 +7,7 @@
                     {
                         "name":  "pc-usage",
                         "source":  "./plugins/pc-usage",
-                        "description":  "PC별 Claude Code 토큰 사용량과 세션 메타데이터를 대시보드 아티팩트에 매시 기록"
+                        "description":  "PC별 Claude Code 토큰 사용량을 매시 재서 claude.ai 대시보드 아티팩트 또는 사내 수집 서버에 기록(대화 내용 없음)"
                     }
                 ]
 }

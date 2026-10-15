@@ -13,9 +13,9 @@ import type { EngineInterface, Register, Timer } from 'claude-code'
 // 0.7.0: every document also carries `ver` (this mod's version) and `site` (회사 or 외부, from config.json),
 // and the marks of a dashboard other than the first one live in their own folder, so a PC pointed at a new
 // dashboard (another account) records its last 7 days there again.
-// 0.9.0: a PC whose config.json says site 회사 and gives a hubUrl sends to the AI_Hub instead
-// (POST <hubUrl>/api/pcu/ingest, 02_pc_usage/hub/허브설계.md e절) and never calls ArtifactData; its marks
-// live in `marks_hub`. Every other PC records to the dashboard exactly as before.
+// 0.9.0: a PC whose config.json says site 회사 and gives a hubUrl sends to the usage hub instead
+// (POST <hubUrl>/api/pcu/ingest, see "Hub" below) and never calls ArtifactData; its marks live in
+// `marks_hub`. Every other PC records to the dashboard exactly as before.
 
 export const HOURS = Array.from({ length: 24 }, (_, i) => i + 1)
 const CHECK_MS = 5 * 60 * 1000
@@ -26,9 +26,10 @@ const CALL_MS = 2 * 60 * 1000
 // The name in plugin.json, as `next.origin.plugin` reads this mod's own calls.
 const PLUGIN = 'pc-usage'
 // Keep equal to plugin.json's version; the dashboard shows it per PC.
-export const VERSION = '0.9.0'
-// The dashboard 0.6.0 and before wrote to: its marks stay in the folders they were written in.
-const LEGACY_ARTIFACT = 'AWvcFaQivhBzG4oDw54Ucv'
+export const VERSION = '0.9.1'
+// The dashboard 0.6.0 and before wrote to, whose marks stay in the folders they were written in: the first
+// dashboard's id, hashed (fnv1a) so the id itself is not in the published code.
+const LEGACY_ARTIFACT_HASH = '136c1d49'
 // Focus hours, for every viewer of the dashboard: 08:00 up to each of 09..17, never the hours before 08:00.
 export const FOCUS_HOURS = [9, 10, 11, 12, 13, 14, 15, 16, 17]
 export const FOCUS_BASE = 8
@@ -92,7 +93,7 @@ export const artifactId = (url: string) => url.replace(/\/+$/, '').split('/').po
  */
 export function marksFolder(artifactUrl: string | undefined, pc: string): string {
   const id = artifactUrl ? artifactId(artifactUrl) : ''
-  if (!id || id === LEGACY_ARTIFACT) return pcKey(pc) === pc ? 'marks' : 'marks2'
+  if (!id || fnv1a(id) === LEGACY_ARTIFACT_HASH) return pcKey(pc) === pc ? 'marks' : 'marks2'
   return `marks_${id.replace(/[^A-Za-z0-9_-]/g, '-')}`
 }
 
@@ -154,9 +155,14 @@ export function focusValue(slotH: Slot | undefined, slot8: Slot | undefined): { 
 export function pcKey(pc: string): string {
   const safe = pc.replace(/[^A-Za-z0-9_-]/g, '-')
   if (safe === pc) return pc
+  return `${safe}~${fnv1a(pc)}`
+}
+
+/** FNV-1a, 32 bits, over the string's UTF-16 code units, as 8 lowercase hex digits. */
+export function fnv1a(s: string): string {
   let h = 0x811c9dc5
-  for (let i = 0; i < pc.length; i++) h = Math.imul(h ^ pc.charCodeAt(i), 0x01000193) >>> 0
-  return `${safe}~${h.toString(16).padStart(8, '0')}`
+  for (let i = 0; i < s.length; i++) h = Math.imul(h ^ s.charCodeAt(i), 0x01000193) >>> 0
+  return h.toString(16).padStart(8, '0')
 }
 
 /** `months` and `focusMonths` id: YYYY-MM_<pcKey>, from a YYYY-MM-DD date. */
@@ -238,11 +244,14 @@ export function sessionEntry(s: Raw, at: number): Raw {
   return d
 }
 
-// ---- Hub (0.9.0). The contract is 02_pc_usage/hub/허브설계.md e-1 (request) and e-2 (response, marks).
+// ---- Hub (0.9.0). One POST carries a PC's hour cells and finished sessions:
+//   { pcKey, pc, via: "mod", ver, site, profile, hours: [{ date, hour, v, models }], sessions: [{ sessionId, date, end, meta }] }
+// The hub answers 200 { ok: true, hours: [...], sessions: [...] } with one result per item (new, dup, conflict,
+// future or error), 202 while the PC waits for approval, or an error status with a reason.
 
 /** The hub's marks folder, apart from every dashboard's, so a PC moved to the hub sends its last 7 days there. */
 export const HUB_MARKS = 'marks_hub'
-/** The most hour cells and sessions one request may carry (e-1); more go in further requests. */
+/** The most hour cells and sessions one request may carry; more go in further requests. */
 export const HUB_MAX_HOURS = 400
 export const HUB_MAX_SESSIONS = 200
 const HUB_PATH = '/api/pcu/ingest'
@@ -274,7 +283,7 @@ export function hubSession(s: ScannedSession): HubSession {
   return { sessionId: s.sessionId, date, end, meta: sessionEntry(s, end) }
 }
 
-/** A request body as e-1 has it for the mod: via "mod", the PC's pcKey and name, the version, site and profile. */
+/** A request body for the mod: via "mod", the PC's pcKey and name, the version, site and profile. */
 export function hubBody(base: HubBase, hours: HubHour[], sessions: HubSession[]): Raw {
   return { pcKey: pcKey(base.pc), pc: base.pc, via: 'mod', ver: VERSION, site: base.site, profile: base.profile, hours, sessions }
 }
@@ -313,7 +322,7 @@ export function hubOutcome(status: number, text: string): HubOutcome {
   return { kind: 'fail', status, reason: status ? reason : `연결 실패: ${reason}` }
 }
 
-/** Item results that leave a mark (e-2): new, already there, or a different value kept by the hub. future and error are sent again. */
+/** Item results that leave a mark: new, already there, or a different value kept by the hub. future and error are sent again. */
 const HUB_DONE = new Set(['new', 'dup', 'conflict'])
 export const hubMarks = (results: string[]) => results.map(r => HUB_DONE.has(r))
 
