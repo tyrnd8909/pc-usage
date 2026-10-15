@@ -10,4 +10,4 @@ Claude Code 모드(플러그인)입니다. 이 PC의 Claude Code 토큰 사용�
 - 플러그인: `pc-usage@pc-usage-mkt` (`plugins/pc-usage`)
 - 기록할 곳(대시보드 주소 또는 수집 서버 주소)과 위치는 PC의 `config.json`에 있고, 이 저장소에는 없습니다.
 
-현재 버전: 0.9.1
+현재 버전: 0.9.2

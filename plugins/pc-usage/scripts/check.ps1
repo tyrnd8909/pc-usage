@@ -1,6 +1,7 @@
 ﻿# pc-usage 자가 진단 (Windows PowerShell 5.1 이상). 설치 스크립트가 끝에 실행하고, 상태확인.cmd 로 언제든 다시 실행할 수 있습니다.
-# 하는 일: 설정(대시보드 주소·위치)을 보여 주고, 오늘 사용량을 실제로 측정해 보고, 모드가 마지막으로 남긴 결과(last.json)를 보여 줍니다.
-# 대시보드에 쓰는 일은 Claude Code 세션 안의 모드만 할 수 있어서, 여기서는 쓰지 않습니다.
+# 하는 일: 설정(기록할 곳·위치)을 보여 주고, 오늘 사용량을 실제로 측정해 보고, 모드가 마지막으로 남긴 결과(last.json)를 보여 줍니다.
+# 기록을 보내는 일은 Claude Code 세션 안의 모드만 하고, 여기서는 보내지 않습니다.
+# 0.9.2: 위치가 회사이고 hubUrl 이 있으면 사내 허브로 기록하는 PC다(대시보드 주소가 없어도 정상). last.json 의 허브 상태도 보여 준다.
 #   -DataRoot  config.json 이 있는 폴더 (기본: %ProgramData%\pc-usage\config.json 이 있으면 그곳, 없으면 %USERPROFILE%\.claude\pc-usage)
 # 측정 스크립트는 이 파일과 같은 폴더의 measure.ps1 을 씁니다.
 param(
@@ -22,9 +23,11 @@ Write-Host "  데이터 폴더: $DataRoot"
 # 1) 설정
 $cfg = $null
 try { $cfg = [IO.File]::ReadAllText((Join-Path $DataRoot 'config.json')).TrimStart([char]0xFEFF) | ConvertFrom-Json } catch { }
-if ($cfg -and $cfg.artifactUrl) { Line '정상' "대시보드: $($cfg.artifactUrl)" }
-else { Line '오류' 'config.json 이 없거나 대시보드 주소가 없습니다. 설치를 다시 하세요.'; $ok = $false }
-if ($cfg -and $cfg.site) { Line '정상' "위치: $($cfg.site)" } else { Line '참고' '위치가 없습니다. 대시보드는 IP로 회사/외부를 판단합니다.' }
+$hubMode = $cfg -and $cfg.site -eq '회사' -and $cfg.hubUrl
+if ($hubMode) { Line '정상' "기록할 곳: 사내 허브 $($cfg.hubUrl)" }
+elseif ($cfg -and $cfg.artifactUrl) { Line '정상' "기록할 곳: 대시보드 $($cfg.artifactUrl)" }
+else { Line '오류' 'config.json 이 없거나 기록할 곳(허브 주소)이 없습니다. 설치를 다시 하세요.'; $ok = $false }
+if ($cfg -and $cfg.site) { Line '정상' "위치: $($cfg.site)" } else { Line '참고' '위치가 없습니다.' }
 
 # 2) 측정: 오늘 0시부터 지금 정각까지(0시대이면 1시까지)
 $measure = Join-Path $PSScriptRoot 'measure.ps1'
@@ -57,7 +60,14 @@ if (Test-Path $last) {
     $l = [IO.File]::ReadAllText($last) | ConvertFrom-Json
     $when = ([DateTimeOffset]::FromUnixTimeMilliseconds([long]$l.at)).LocalDateTime
     Line '정상' ("모드 마지막 실행: {0:MM-dd HH:mm} (v{1}) {2}" -f $when, $l.ver, $l.text)
-    if ($cfg -and $l.artifactUrl -and $l.artifactUrl -ne $cfg.artifactUrl) { Line '참고' '마지막 실행은 다른 대시보드 주소였습니다. 새 세션을 열면 새 주소로 기록합니다.' }
+    if ($hubMode -and $l.hub) {
+      switch ($l.hub.kind) {
+        'ok'      { Line '정상' '허브 기록: 정상' }
+        'pending' { Line '참고' '허브 승인 대기: 관리자가 허브의 [PC 등록하기] 또는 PC 상태 화면에서 승인하면 기록이 시작됩니다.' }
+        'denied'  { Line '오류' ("허브가 거절함(HTTP {0}): {1}" -f $l.hub.status, $l.hub.reason); $ok = $false }
+        'fail'    { Line '참고' ("허브 연결 실패: {0}. 다음 확인 때 다시 보냅니다." -f $l.hub.reason) }
+      }
+    } elseif (-not $hubMode -and $cfg -and $l.artifactUrl -and $l.artifactUrl -ne $cfg.artifactUrl) { Line '참고' '마지막 실행은 다른 대시보드 주소였습니다. 새 세션을 열면 새 주소로 기록합니다.' }
   } catch { Line '참고' 'last.json 을 읽지 못했습니다.' }
 } else { Line '참고' '모드가 아직 실행된 적이 없습니다(0.7.0 이후 기록). Claude Code 세션을 열고 /pc-usage 를 입력하세요.' }
 

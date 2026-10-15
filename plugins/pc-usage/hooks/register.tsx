@@ -26,7 +26,7 @@ const CALL_MS = 2 * 60 * 1000
 // The name in plugin.json, as `next.origin.plugin` reads this mod's own calls.
 const PLUGIN = 'pc-usage'
 // Keep equal to plugin.json's version; the dashboard shows it per PC.
-export const VERSION = '0.9.1'
+export const VERSION = '0.9.2'
 // The dashboard 0.6.0 and before wrote to, whose marks stay in the folders they were written in: the first
 // dashboard's id, hashed (fnv1a) so the id itself is not in the published code.
 const LEGACY_ARTIFACT_HASH = '136c1d49'
