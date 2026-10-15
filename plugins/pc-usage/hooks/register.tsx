@@ -13,6 +13,9 @@ import type { EngineInterface, Register, Timer } from 'claude-code'
 // 0.7.0: every document also carries `ver` (this mod's version) and `site` (회사 or 외부, from config.json),
 // and the marks of a dashboard other than the first one live in their own folder, so a PC pointed at a new
 // dashboard (another account) records its last 7 days there again.
+// 0.9.0: a PC whose config.json says site 회사 and gives a hubUrl sends to the AI_Hub instead
+// (POST <hubUrl>/api/pcu/ingest, 02_pc_usage/hub/허브설계.md e절) and never calls ArtifactData; its marks
+// live in `marks_hub`. Every other PC records to the dashboard exactly as before.
 
 export const HOURS = Array.from({ length: 24 }, (_, i) => i + 1)
 const CHECK_MS = 5 * 60 * 1000
@@ -23,7 +26,7 @@ const CALL_MS = 2 * 60 * 1000
 // The name in plugin.json, as `next.origin.plugin` reads this mod's own calls.
 const PLUGIN = 'pc-usage'
 // Keep equal to plugin.json's version; the dashboard shows it per PC.
-export const VERSION = '0.8.0'
+export const VERSION = '0.9.0'
 // The dashboard 0.6.0 and before wrote to: its marks stay in the folders they were written in.
 const LEGACY_ARTIFACT = 'AWvcFaQivhBzG4oDw54Ucv'
 // Focus hours, for every viewer of the dashboard: 08:00 up to each of 09..17, never the hours before 08:00.
@@ -44,27 +47,35 @@ type Raw = Record<string, any>
 type Total = { input: number; output: number; cacheRead: number; cacheWrite: number; messages: number }
 const FIELDS = ['input', 'output', 'cacheRead', 'cacheWrite', 'messages'] as const
 
-type Dirs = { data: string; user: string; pc: string; scripts: string }
+type Dirs = { data: string; user: string; pc: string; scripts: string; profile: string }
 let dirs: Dirs | null = null
+
+/** The Windows user profile folder's name, the last part of USERPROFILE (C:\Users\kim → kim); the hub's `profile`. */
+export function profileName(home: string): string {
+  return home.replace(/[\\/]+$/, '').split(/[\\/]/).pop() ?? ''
+}
 
 /**
  * Where the files are, decided once per session. config.json from %ProgramData%\pc-usage when it is there
  * (a machine-wide install), else from <user home>\.claude\pc-usage; marks always per user.
  * The scripts ship in the plugin's own scripts folder (0.8.0), so an auto-update brings them along;
  * an install older than that kept them in the data folder, which is used when the plugin has none.
+ * PCU_DIR is for tests only, never set in use: config.json, the marks and last.json are all read and
+ * written there instead, so a test touches neither the user's folder nor ProgramData.
  */
 async function paths($: EngineInterface): Promise<Dirs> {
   if (!dirs) {
     const home = (await $.env.get('USERPROFILE')) ?? (await $.env.get('HOME')) ?? ''
-    const user = `${home}\\.claude\\pc-usage`
+    const testDir = await $.env.get('PCU_DIR')
+    const user = testDir || `${home}\\.claude\\pc-usage`
     const programData = await $.env.get('ProgramData')
     const shared = programData ? `${programData}\\pc-usage` : null
     const has = (p: string) => $.fs.exists(p).catch(() => false)
-    const isShared = !!shared && (await has(`${shared}\\config.json`))
+    const isShared = !testDir && !!shared && (await has(`${shared}\\config.json`))
     const data = isShared && shared ? shared : user
     const own = `${$.plugin.root}\\scripts`
     const pc = (await $.env.get('COMPUTERNAME')) ?? ''
-    dirs = { data, user, pc, scripts: (await has(`${own}\\measure.ps1`)) ? own : data }
+    dirs = { data, user, pc, scripts: (await has(`${own}\\measure.ps1`)) ? own : data, profile: profileName(home) }
   }
   return dirs
 }
@@ -227,7 +238,104 @@ export function sessionEntry(s: Raw, at: number): Raw {
   return d
 }
 
-type Config = { artifactUrl?: string; site?: string }
+// ---- Hub (0.9.0). The contract is 02_pc_usage/hub/허브설계.md e-1 (request) and e-2 (response, marks).
+
+/** The hub's marks folder, apart from every dashboard's, so a PC moved to the hub sends its last 7 days there. */
+export const HUB_MARKS = 'marks_hub'
+/** The most hour cells and sessions one request may carry (e-1); more go in further requests. */
+export const HUB_MAX_HOURS = 400
+export const HUB_MAX_SESSIONS = 200
+const HUB_PATH = '/api/pcu/ingest'
+const HUB_CALL_MS = 60 * 1000
+
+export type HubHour = { date: string; hour: number; v: Arr; models: Record<string, Arr> | null }
+export type HubSession = { sessionId: string; date: string; end: number; meta: Raw }
+export type HubBase = { pc: string; profile: string; site: string | null }
+
+/** The ingest URL from config.json's hubUrl, with or without a trailing slash. */
+export const hubIngestUrl = (hubUrl: string) => `${hubUrl.trim().replace(/\/+$/, '')}${HUB_PATH}`
+
+/** One day's hour cells for the hub: v as [input, output, cacheRead, cacheWrite, messages], models at 08, 17 and 24 only, else null. */
+export function hubHours(date: string, slots: Slots, hours: number[]): HubHour[] {
+  return hours.map(h => ({
+    date, hour: h, v: toArr(slotOf(slots, h)?.total),
+    models: MODEL_HOURS.includes(h) ? arrByModel(slotOf(slots, h)?.byModel) : null,
+  }))
+}
+
+/**
+ * One finished session for the hub: its start day, its end, and sessionEntry's metadata. recordedAt is the session's
+ * end, not the send time, so the same session sent again (an answer lost on the way) is the same value: the hub says
+ * dup, not conflict. The hub keeps its own receivedAt.
+ */
+export function hubSession(s: ScannedSession): HubSession {
+  const date = typeof s.date === 'string' ? s.date : localDate(new Date(Number(s.start)))
+  const end = Number(s.end)
+  return { sessionId: s.sessionId, date, end, meta: sessionEntry(s, end) }
+}
+
+/** A request body as e-1 has it for the mod: via "mod", the PC's pcKey and name, the version, site and profile. */
+export function hubBody(base: HubBase, hours: HubHour[], sessions: HubSession[]): Raw {
+  return { pcKey: pcKey(base.pc), pc: base.pc, via: 'mod', ver: VERSION, site: base.site, profile: base.profile, hours, sessions }
+}
+
+/** Splits cells and sessions into requests of at most HUB_MAX_HOURS cells and HUB_MAX_SESSIONS sessions; none when both are empty. */
+export function hubBatches<H, S>(hours: H[], sessions: S[]): { hours: H[]; sessions: S[] }[] {
+  const n = Math.max(Math.ceil(hours.length / HUB_MAX_HOURS), Math.ceil(sessions.length / HUB_MAX_SESSIONS))
+  return Array.from({ length: n }, (_, i) => ({
+    hours: hours.slice(i * HUB_MAX_HOURS, (i + 1) * HUB_MAX_HOURS),
+    sessions: sessions.slice(i * HUB_MAX_SESSIONS, (i + 1) * HUB_MAX_SESSIONS),
+  }))
+}
+
+/** What the hub said: per item results (ok), waiting for approval, refused (400/401/403/503), or no answer (no connection, 5xx, garbled). */
+export type HubOutcome =
+  | { kind: 'ok'; hours: string[]; sessions: string[] }
+  | { kind: 'pending' }
+  | { kind: 'denied'; status: number; reason: string }
+  | { kind: 'fail'; status: number; reason: string }
+
+/** Reads the hub's answer to one request (status 0: no connection; text then holds the error). */
+export function hubOutcome(status: number, text: string): HubOutcome {
+  let j: Raw | null = null
+  try { j = JSON.parse(text) } catch {}
+  // The ingest route says why in `reason` or a word in `status`; PocketBase's own errors ({status: 404, message}) in `message`.
+  const why = j ? (j.reason ?? (typeof j.status === 'string' ? j.status : undefined) ?? j.message) : undefined
+  const reason = String(why ?? text ?? '').slice(0, 300)
+  if (status === 200 && j && j.ok === true) {
+    const list = (x: unknown) => (Array.isArray(x) ? x.map(String) : [])
+    return { kind: 'ok', hours: list(j.hours), sessions: list(j.sessions) }
+  }
+  if (status === 202) return { kind: 'pending' }
+  // A timeout (408) or a rate limit (429) passes; the next check tries again, as for no connection.
+  if (status === 408 || status === 429) return { kind: 'fail', status, reason }
+  if (status >= 400 && status < 500 || status === 503) return { kind: 'denied', status, reason }
+  return { kind: 'fail', status, reason: status ? reason : `연결 실패: ${reason}` }
+}
+
+/** Item results that leave a mark (e-2): new, already there, or a different value kept by the hub. future and error are sent again. */
+const HUB_DONE = new Set(['new', 'dup', 'conflict'])
+export const hubMarks = (results: string[]) => results.map(r => HUB_DONE.has(r))
+
+/** The /pc-usage line for one hub run. */
+export function hubSummary(c: { new: number; dup: number; conflict: number; again: number; sessions: number; skipped: number },
+  stop: HubOutcome | null): string {
+  const cells = c.new + c.dup + c.conflict
+  let t = `허브 기록 ${cells}칸(새 ${c.new}, 이미 ${c.dup}, 충돌 ${c.conflict})`
+  if (c.again) t += `, 다시 보낼 칸 ${c.again}`
+  if (c.skipped) t += `, 사용 없는 지난 시각 ${c.skipped}칸 건너뜀`
+  t += `, 세션 ${c.sessions}건`
+  if (stop?.kind === 'pending') t += '. 허브 승인 대기: 관리자가 이 PC를 승인하면 다음 확인 때 보냅니다'
+  else if (stop?.kind === 'denied') t += `. 허브가 거절함(HTTP ${stop.status}): ${stop.reason}`
+  else if (stop?.kind === 'fail')
+    t += `. 허브 연결 실패${stop.status ? `(HTTP ${stop.status})` : ''}: ${stop.reason.replace(/^연결 실패: /, '')}. 다음 확인 때 다시 보냅니다`
+  return `${t}.`
+}
+
+type Config = { artifactUrl?: string; site?: string; hubUrl?: string }
+
+/** True when this PC records to the hub: site 회사 and a hubUrl. An external PC, or one with no hubUrl, keeps the dashboard. */
+export const isHubMode = (cfg: Config) => siteOf(cfg.site) === '회사' && typeof cfg.hubUrl === 'string' && cfg.hubUrl.trim() !== ''
 
 /** config.json's site as the dashboard shows it: 회사 or 외부, else null (the dashboard then goes by IP). */
 export function siteOf(site: unknown): '회사' | '외부' | null {
@@ -250,16 +358,16 @@ async function readConfig($: EngineInterface): Promise<Config> {
   }
 }
 
-async function readMarks($: EngineInterface): Promise<Set<string>> {
+async function readMarks($: EngineInterface, dir?: string): Promise<Set<string>> {
   try {
-    return new Set((await $.fs.list(await marksDir($))).map(e => e.name))
+    return new Set((await $.fs.list(dir ?? (await marksDir($)))).map(e => e.name))
   } catch {
     return new Set()
   }
 }
 
-async function mark($: EngineInterface, names: string[], at: number) {
-  const dir = await marksDir($)
+async function mark($: EngineInterface, names: string[], at: number, into?: string) {
+  const dir = into ?? (await marksDir($))
   for (const n of names) await $.fs.write(`${dir}\\${n}`, String(at))
 }
 
@@ -276,11 +384,11 @@ async function measure($: EngineInterface, date: string, hours: number[]): Promi
 }
 
 /** Lists this PC's finished sessions (sessions.ps1); null when the scan fails. */
-async function scanSessions($: EngineInterface): Promise<{ pc: string; ip?: string | null; sessions: ScannedSession[] } | null> {
+async function scanSessions($: EngineInterface, dir?: string): Promise<{ pc: string; ip?: string | null; sessions: ScannedSession[] } | null> {
   try {
     const argv = ['powershell', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File',
       await scriptFile($, 'sessions.ps1'), '-Since', String(BACKFILL_DAYS), '-IdleMinutes', String(IDLE_MINUTES),
-      '-MarksDir', await marksDir($)]
+      '-MarksDir', dir ?? (await marksDir($))]
     const { stdout } = await $.process.run(argv, { timeoutMs: 300000 })
     const j = JSON.parse(stdout.trim())
     return j.ok && Array.isArray(j.sessions) ? j : null
@@ -363,6 +471,9 @@ function failNote(fails: Write[]): string {
 let running = false
 let lastResult = '아직 측정하지 않았습니다.'
 let lastScan = 0
+let hubHold = 0
+/** How long the timer leaves the hub alone after pending or a refusal (approval takes a person), and after no connection. */
+const HUB_HOLD_MS = { stop: 30 * 60 * 1000, fail: 10 * 60 * 1000 }
 
 /** Records every due hour, and every SCAN_MS (or when forced) the finished sessions; returns a one-line summary. */
 async function tick($: EngineInterface, force = false): Promise<string> {
@@ -370,6 +481,23 @@ async function tick($: EngineInterface, force = false): Promise<string> {
   running = true
   try {
     const cfg = await readConfig($)
+    if (isHubMode(cfg)) {
+      const now = await $.clock.now()
+      // After a pending, refused or failed answer, the 5-minute timer waits (HUB_HOLD_MS) instead of measuring
+      // 7 days again each time; /pc-usage (force) always tries.
+      if (!force && now < hubHold) return lastResult
+      const scan = force || now - lastScan >= SCAN_MS
+      if (scan) lastScan = now
+      let r: { text: string; stop: HubOutcome | null }
+      try {
+        r = await recordHub($, cfg.hubUrl as string, scan)
+      } catch (err) {
+        const reason = String((err as Error)?.message ?? err).slice(0, 300)
+        r = { text: `허브 기록 중 오류: ${reason}. 다음 확인 때 다시 시도합니다.`, stop: { kind: 'fail', status: 0, reason } }
+      }
+      hubHold = r.stop ? now + HUB_HOLD_MS[r.stop.kind === 'fail' ? 'fail' : 'stop'] : 0
+      return (lastResult = await saveLast($, r.text, cfg, r.stop))
+    }
     const artifactUrl = cfg.artifactUrl
     if (!artifactUrl) return (lastResult = await saveLast($, 'config.json에 artifactUrl이 없어 기록하지 않았습니다.', cfg))
     const site = siteOf(cfg.site)
@@ -389,13 +517,114 @@ async function tick($: EngineInterface, force = false): Promise<string> {
  * Keeps the last summary in <user>\.claude\pc-usage\last.json, so the installer's self-check and a person
  * looking at the PC can see whether recording works without opening a session; returns the text.
  */
-async function saveLast($: EngineInterface, text: string, cfg: Config): Promise<string> {
+async function saveLast($: EngineInterface, text: string, cfg: Config, stop?: HubOutcome | null): Promise<string> {
   try {
     const at = await $.clock.now()
-    await $.fs.write(`${(await paths($)).user}\\last.json`,
-      JSON.stringify({ at, time: new Date(at).toISOString(), ver: VERSION, artifactUrl: cfg.artifactUrl ?? null, text }))
+    const last: Raw = { at, time: new Date(at).toISOString(), ver: VERSION, artifactUrl: cfg.artifactUrl ?? null, text }
+    // A hub PC also keeps where it sent and why the hub stopped it (pending, refused with its reason, or no connection).
+    if (isHubMode(cfg)) Object.assign(last, { hubUrl: cfg.hubUrl, hub: stop ?? { kind: 'ok' } })
+    await $.fs.write(`${(await paths($)).user}\\last.json`, JSON.stringify(last))
   } catch {}
   return text
+}
+
+/** One POST to the hub, given up after HUB_CALL_MS; status 0 with the error as text when it could not connect. */
+async function hubPost($: EngineInterface, url: string, body: Raw): Promise<{ status: number; text: string }> {
+  let expire!: (r: { status: number; text: string }) => void
+  const timeout = new Promise<{ status: number; text: string }>(res => (expire = res))
+  const timer = $.clock.after(HUB_CALL_MS, () => expire({ status: 0, text: '응답 없음(1분 초과)' }))
+  const failed = (err: unknown) => ({ status: 0, text: String((err as Error)?.message ?? err) })
+  let send: Promise<{ status: number; text: string }>
+  try {
+    send = $.http.fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+      .then(r => ({ status: r.status, text: r.text }), failed)
+  } catch (err) {
+    send = Promise.resolve(failed(err))
+  }
+  try {
+    return await Promise.race([send, timeout])
+  } finally {
+    timer.cancel()
+  }
+}
+
+/**
+ * Sends every due hour (the last 7 days, marks in `marks_hub`) and, when `scan`, the finished sessions to the hub.
+ * Requests go one by one; a pending, refused or failed one stops the rest, which the next check sends again.
+ * Only the cells and sessions the hub answered new, dup or conflict are marked. Never calls ArtifactData.
+ */
+async function recordHub($: EngineInterface, hubUrl: string, scan: boolean): Promise<{ text: string; stop: HubOutcome | null }> {
+  const p = await paths($)
+  const dir = `${p.user}\\${HUB_MARKS}`
+  const done = await readMarks($, dir)
+  const now = new Date(await $.clock.now())
+  const due = dueSlots(now, done)
+  let pc = p.pc
+  let measureFail = ''
+  let skipped = 0
+  const hours: HubHour[] = []
+  for (const [date, hrs] of [...due.entries()].sort(([a], [b]) => a.localeCompare(b))) {
+    const m = await measure($, date, hrs)
+    if (!m) {
+      measureFail = ` ${date} 측정에 실패했습니다. 다음 확인 때 다시 시도합니다.`
+      break
+    }
+    pc = m.pc || pc
+    const slots = m.slots as Slots
+    // A past day with no use at all: nothing to send, just remember it was checked (as for the dashboard).
+    if (date !== localDate(now) && !hrs.some(h => (slotOf(slots, h)?.total?.messages ?? 0) > 0)) {
+      await mark($, hrs.map(h => markName(date, h)), await $.clock.now(), dir)
+      skipped += hrs.length
+      continue
+    }
+    hours.push(...hubHours(date, slots, hrs))
+  }
+  const sessions: HubSession[] = []
+  let scanFail = ''
+  if (scan) {
+    const s = await scanSessions($, dir)
+    if (!s) scanFail = ' 세션 스캔에 실패했습니다.'
+    else {
+      pc = s.pc || pc
+      const marks = new Map<string, number>()
+      for (const x of s.sessions) {
+        const name = sessionMark(x.sessionId)
+        if (done.has(name)) marks.set(x.sessionId, Number(await $.fs.read(`${dir}\\${name}`).catch(() => '0')) || 0)
+      }
+      const { create, update } = sessionDue(s.sessions, marks)
+      sessions.push(...[...create, ...update].map(x => hubSession(x)))
+    }
+  }
+  const base: HubBase = { pc, profile: p.profile, site: '회사' }
+  const url = hubIngestUrl(hubUrl)
+  const c = { new: 0, dup: 0, conflict: 0, again: 0, sessions: 0, skipped }
+  let stop: HubOutcome | null = null
+  for (const b of hubBatches(hours, sessions)) {
+    const r = await hubPost($, url, hubBody(base, b.hours, b.sessions))
+    const o = hubOutcome(r.status, r.text)
+    if (o.kind !== 'ok') {
+      stop = o
+      break
+    }
+    const at = await $.clock.now()
+    const hm = hubMarks(o.hours)
+    await mark($, b.hours.filter((_, i) => hm[i]).map(h => markName(h.date, h.hour)), at, dir)
+    for (let i = 0; i < b.hours.length; i++) {
+      const k = o.hours[i]
+      if (k === 'new' || k === 'dup' || k === 'conflict') c[k]++
+      else c.again++
+    }
+    const sm = hubMarks(o.sessions)
+    for (const [i, s] of b.sessions.entries()) {
+      if (!sm[i]) continue
+      await $.fs.write(`${dir}\\${sessionMark(s.sessionId)}`, String(s.end))
+      c.sessions++
+    }
+  }
+  if (!hours.length && !sessions.length && !stop && !measureFail)
+    return { text: `기록할 시각이 없습니다 (모두 허브에 기록됨${skipped ? `, 사용 없는 지난 시각 ${skipped}칸 건너뜀` : ''}).${scanFail}`, stop }
+  const t = new Date(await $.clock.now()).toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit' })
+  return { text: `${t} ${hubSummary(c, stop)}${measureFail}${scanFail}`, stop }
 }
 
 /** Writes finished sessions into their start day's `sessionDays` document, one field each; new ones and those that went on alike. */
@@ -511,7 +740,7 @@ function start($: EngineInterface) {
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     const started = await next(e)
-    await $.command.register({ name: 'pc-usage', description: '이 PC의 토큰 사용량과 끝난 세션 정보를 지금 대시보드에 기록합니다' })
+    await $.command.register({ name: 'pc-usage', description: '이 PC의 토큰 사용량과 끝난 세션 정보를 지금 기록합니다(회사 PC는 허브, 그 밖은 대시보드)' })
     start($)
     return started
   })
